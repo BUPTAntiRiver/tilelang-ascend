@@ -637,20 +637,25 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     BroadcastableBufferCollector collector(parallel_vars, inner_vec_len, outer_extent, this);
     collector(store->value);
 
-    // Step 2: Create temp buffers for broadcasted 1D buffers
+    // Step 2: Create temp buffers for broadcasted 1D buffers and workspace buffers
     Array<Stmt> broadcast_stmts;
     std::unordered_map<const BufferLoadNode*, Buffer> broadcast_buffer_map;
+    std::unordered_map<const BufferLoadNode*, Buffer> workspace_buffer_map;
 
-    for (const auto& info : collector.broadcast_infos) {
-      Buffer broadcast_buffer = CreateBroadcastBuffer(info.load->buffer, info.outer_extent, info.inner_vec_len);
-      broadcast_buffer_map[info.load] = broadcast_buffer;
+    for (auto& info : collector.broadcast_infos) {
+      info.broadcast_buffer = CreateBroadcastBuffer(info.load->buffer, info.outer_extent, info.inner_vec_len);
+      info.workspace_buffer = CreateBroadcastWorkspaceBuffer(info.outer_extent, info.inner_vec_len);
+      broadcast_buffer_map[info.load] = info.broadcast_buffer;
+      workspace_buffer_map[info.load] = info.workspace_buffer;
     }
 
     // Step 3: Generate broadcast calls
     for (const auto& info : collector.broadcast_infos) {
       Buffer broadcast_buffer = broadcast_buffer_map[info.load];
+      Buffer workspace_buffer = workspace_buffer_map[info.load];
       Stmt broadcast_stmt = GenerateBroadcastStmt(info.load->buffer, broadcast_buffer,
-                                                  info.broadcast_dim, info.outer_extent, info.inner_vec_len);
+                                                  workspace_buffer, info.broadcast_dim,
+                                                  info.outer_extent, info.inner_vec_len);
       broadcast_stmts.push_back(broadcast_stmt);
     }
 
@@ -1409,10 +1414,10 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     return false;
   }
 
-  // Create a broadcast buffer with uint8 type for temporary storage
+  // Create a broadcast buffer with the same dtype as the source buffer
   Buffer CreateBroadcastBuffer(const Buffer& ref, int64_t outer_extent, int64_t inner_vec_len) {
-    // Use uint8 type for the broadcast buffer
-    DataType dtype = DataType::UInt(8);
+    // Use the same dtype as the source buffer for proper type matching
+    DataType dtype = ref->dtype;
 
     Var data(
       ref->name + "_broadcast_" + std::to_string(temp_buffer_id_++) + "_data",
@@ -1440,9 +1445,41 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     return buf;
   }
 
+  // Create a temporary uint8 buffer for broadcast workspace
+  Buffer CreateBroadcastWorkspaceBuffer(int64_t outer_extent, int64_t inner_vec_len) {
+    // Use uint8 type for the temporary workspace
+    DataType dtype = DataType::UInt(8);
+
+    Var data(
+      "broadcast_workspace_" + std::to_string(temp_buffer_id_++) + "_data",
+      PointerType(PrimType(dtype), "shared")
+    );
+
+    // Create 2D shape for workspace
+    Array<PrimExpr> shape;
+    shape.push_back(IntImm(DataType::Int(32), outer_extent));
+    shape.push_back(IntImm(DataType::Int(32), inner_vec_len));
+
+    Buffer buf = Buffer(
+      data,
+      dtype,
+      shape,
+      /*strides=*/{},
+      /*elem_offset=*/PrimExpr(0),
+      /*name=*/data->name_hint,
+      /*data_alignment=*/0,
+      /*offset_factor=*/0,
+      /*buffer_type=*/kDefault
+    );
+
+    temp_buffers_.push_back(buf);
+    return buf;
+  }
+
   // Generate broadcast statement to broadcast a 1D buffer to a 2D buffer
   Stmt GenerateBroadcastStmt(const Buffer& src_1d,
                              const Buffer& dst_2d,
+                             const Buffer& workspace,
                              int64_t broadcast_dim,
                              int64_t outer_extent,
                              int64_t inner_vec_len) {
@@ -1467,8 +1504,8 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     broadcast_args.push_back(CreateAccessPtr(src_1d, dtype_str, IntImm(DataType::Int(32), 0),
                                             src_elements, 1));
 
-    // 3. tmp buffer access ptr
-    broadcast_args.push_back(CreateAccessPtr(dst_2d, "uint8", IntImm(DataType::Int(32), 0),
+    // 3. tmp buffer access ptr (workspace buffer)
+    broadcast_args.push_back(CreateAccessPtr(workspace, "uint8", IntImm(DataType::Int(32), 0),
                                             total_elements, 1));
 
     // 4. dim (number of dimensions)
@@ -1489,6 +1526,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
   struct BroadcastInfo {
     const BufferLoadNode* load;
     Buffer broadcast_buffer;
+    Buffer workspace_buffer;
     int64_t broadcast_dim;
     int64_t outer_extent;
     int64_t inner_vec_len;
