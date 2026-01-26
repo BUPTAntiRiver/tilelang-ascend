@@ -677,9 +677,12 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
         auto it = broadcast_buffer_map_.find(op);
         if (it != broadcast_buffer_map_.end()) {
           // Replace with load from broadcast buffer
-          // Use [0] as index since the vectorized operation will handle
-          // accessing all elements of the broadcast buffer as contiguous memory
-          return BufferLoad(it->second, {IntImm(DataType::Int(32), 0)});
+          // Use [0, 0] as indices since the vectorized operation will handle
+          // accessing all elements of the broadcast buffer
+          Array<PrimExpr> new_indices;
+          new_indices.push_back(IntImm(DataType::Int(32), 0));
+          new_indices.push_back(IntImm(DataType::Int(32), 0));
+          return BufferLoad(it->second, new_indices);
         }
         return ExprMutator::VisitExpr_(op);
       }
@@ -1418,9 +1421,48 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     return false;
   }
 
+  // Create a 2D view of a 1D buffer for broadcast operation
+  Buffer CreateBroadcastSourceBuffer(const Buffer& src_1d, int64_t broadcast_dim) {
+    // Use the same data pointer and dtype as the source buffer
+    // but create a 2D shape with one dimension = 1
+    DataType dtype = src_1d->dtype;
+
+    int64_t src_elements = 0;
+    if (auto imm = src_1d->shape[0].as<IntImmNode>()) {
+      src_elements = imm->value;
+    } else {
+      LOG(FATAL) << "Source buffer shape must be constant for broadcast";
+    }
+
+    Array<PrimExpr> shape;
+    if (broadcast_dim == 1) {
+      // Broadcasting along outer dimension: view as [src_elements, 1]
+      shape.push_back(IntImm(DataType::Int(32), src_elements));
+      shape.push_back(IntImm(DataType::Int(32), 1));
+    } else {
+      // Broadcasting along inner dimension: view as [1, src_elements]
+      shape.push_back(IntImm(DataType::Int(32), 1));
+      shape.push_back(IntImm(DataType::Int(32), src_elements));
+    }
+
+    Buffer buf = Buffer(
+      src_1d->data,  // Use the same data pointer
+      dtype,
+      shape,
+      /*strides=*/{},
+      /*elem_offset=*/PrimExpr(0),
+      /*name=*/src_1d->name + "_broadcast_view",
+      /*data_alignment=*/0,
+      /*offset_factor=*/0,
+      /*buffer_type=*/kDefault
+    );
+
+    return buf;
+  }
+
   // Create a broadcast buffer with the same dtype as the source buffer
   Buffer CreateBroadcastBuffer(const Buffer& ref, int64_t outer_extent, int64_t inner_vec_len) {
-    // Use the same dtype as the source buffer for proper type matching
+    // Use the same dtype as the source buffer
     DataType dtype = ref->dtype;
 
     Var data(
@@ -1428,11 +1470,10 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       PointerType(PrimType(dtype), "shared")
     );
 
-    // Create 1D shape for broadcast (total elements)
-    // Vectorized operations expect contiguous 1D buffers
-    int64_t total_elements = outer_extent * inner_vec_len;
+    // Create 2D shape for broadcast (broadcast operation requires same rank as source)
     Array<PrimExpr> shape;
-    shape.push_back(IntImm(DataType::Int(32), total_elements));
+    shape.push_back(IntImm(DataType::Int(32), outer_extent));
+    shape.push_back(IntImm(DataType::Int(32), inner_vec_len));
 
     Buffer buf = Buffer(
       data,
@@ -1450,9 +1491,9 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     return buf;
   }
 
-  // Create a temporary uint8 buffer for broadcast workspace
+  // Create a broadcast workspace buffer with uint8 type for temporary storage
   Buffer CreateBroadcastWorkspaceBuffer(int64_t outer_extent, int64_t inner_vec_len) {
-    // Use uint8 type for the temporary workspace
+    // Use uint8 type for the workspace buffer
     DataType dtype = DataType::UInt(8);
 
     Var data(
@@ -1460,10 +1501,10 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       PointerType(PrimType(dtype), "shared")
     );
 
-    // Create 1D shape for workspace (total elements)
-    int64_t total_elements = outer_extent * inner_vec_len;
+    // Create 2D shape for workspace (broadcast operation requires same rank)
     Array<PrimExpr> shape;
-    shape.push_back(IntImm(DataType::Int(32), total_elements));
+    shape.push_back(IntImm(DataType::Int(32), outer_extent));
+    shape.push_back(IntImm(DataType::Int(32), inner_vec_len));
 
     Buffer buf = Buffer(
       data,
@@ -1481,43 +1522,45 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     return buf;
   }
 
-  // Generate broadcast statement to broadcast a 1D buffer to a 1D buffer (broadcasted data stored contiguously)
+  // Generate broadcast statement to broadcast a 1D buffer to a 2D buffer
   Stmt GenerateBroadcastStmt(const Buffer& src_1d,
-                             const Buffer& dst_1d,
+                             const Buffer& dst_2d,
                              const Buffer& workspace,
                              int64_t broadcast_dim,
                              int64_t outer_extent,
                              int64_t inner_vec_len) {
     // Build the tl.ascend_broadcast call
-    // The broadcast operation uses explicit shape arguments, so the buffer shape doesn't matter
     // Format: tir.call_intrin("handle", tl.ascend_broadcast(), "Broadcast<{dtype}, 2, {axis}, false>",
     //                         dst.access_ptr("w"), src.access_ptr("r"), tmp.access_ptr("r"),
     //                         dim, dst_shape[0], dst_shape[1], ..., src_shape[0], ...)
     Array<PrimExpr> broadcast_args;
+
+    // Create a 2D view of the source buffer for broadcast operation
+    Buffer src_2d_view = CreateBroadcastSourceBuffer(src_1d, broadcast_dim);
 
     // 0. Template argument string
     std::string dtype_str = DTypeToAscendCString(src_1d->dtype);
     std::string template_args = dtype_str + ", 2, " + std::to_string(broadcast_dim) + ", false";
     broadcast_args.push_back(StringImm("Broadcast<" + template_args + ">"));
 
-    // 1. dst buffer access ptr (1D buffer, but broadcast op treats it as 2D based on shape args)
+    // 1. dst buffer access ptr (2D buffer)
     int64_t total_elements = outer_extent * inner_vec_len;
-    broadcast_args.push_back(CreateAccessPtr(dst_1d, dtype_str, IntImm(DataType::Int(32), 0),
+    broadcast_args.push_back(CreateAccessPtr(dst_2d, dtype_str, IntImm(DataType::Int(32), 0),
                                             total_elements, 2));
 
-    // 2. src buffer access ptr - use the actual size of the source buffer
+    // 2. src buffer access ptr (2D view)
     int64_t src_elements = 0;
     if (auto imm = src_1d->shape[0].as<IntImmNode>()) {
       src_elements = imm->value;
     } else {
       LOG(FATAL) << "Source buffer shape must be constant for broadcast";
     }
-    broadcast_args.push_back(CreateAccessPtr(src_1d, dtype_str, IntImm(DataType::Int(32), 0),
-                                            src_elements, 1));
+    broadcast_args.push_back(CreateAccessPtr(src_2d_view, dtype_str, IntImm(DataType::Int(32), 0),
+                                            src_elements, 2));
 
-    // 3. tmp buffer access ptr (workspace buffer)
+    // 3. tmp buffer access ptr (workspace buffer, 2D shape)
     broadcast_args.push_back(CreateAccessPtr(workspace, "uint8", IntImm(DataType::Int(32), 0),
-                                            total_elements, 1));
+                                            total_elements, 2));
 
     // 4. dim (number of dimensions)
     broadcast_args.push_back(IntImm(DataType::Int(32), 2));
@@ -1526,8 +1569,10 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     broadcast_args.push_back(IntImm(DataType::Int(32), outer_extent));
     broadcast_args.push_back(IntImm(DataType::Int(32), inner_vec_len));
 
-    // 6. src shape array (explicit 1D shape for broadcast operation)
-    broadcast_args.push_back(IntImm(DataType::Int(32), src_elements));
+    // 6. src shape array (explicit 2D shape for broadcast operation)
+    // Use the shape from the 2D view of the source buffer
+    broadcast_args.push_back(src_2d_view->shape[0]);
+    broadcast_args.push_back(src_2d_view->shape[1]);
 
     PrimExpr broadcast_call = Call(DataType::Handle(), tl::ascend_broadcast(), broadcast_args);
     return Evaluate(broadcast_call);
