@@ -1511,11 +1511,9 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       PointerType(PrimType(dtype), "shared")
     );
 
-    // Calculate workspace size based on dst dtype byte size
-    // Workspace needs to be large enough to hold the same amount of data as dst
-    // Since workspace is uint8 (1 byte), multiply by dst byte size
-    int64_t dst_byte_size = (dst_dtype.bits() + 7) / 8;
-    int64_t workspace_outer = outer_extent * dst_byte_size;
+    // Workspace buffer should be 2x the size of the dst buffer
+    // This is based on the AscendC broadcast operation requirements
+    int64_t workspace_outer = 2 * outer_extent;
     int64_t workspace_inner = inner_vec_len;
 
     // Create 2D shape for workspace (broadcast operation requires same rank)
@@ -1576,9 +1574,8 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
                                             src_elements, 2));
 
     // 3. tmp buffer access ptr (workspace buffer, 2D shape)
-    // Workspace size should account for byte size difference (uint8 vs dst dtype)
-    int64_t dst_byte_size = (src_1d->dtype.bits() + 7) / 8;
-    int64_t workspace_elements = total_elements * dst_byte_size;
+    // Workspace buffer should be 2x the size of the dst buffer
+    int64_t workspace_elements = 2 * total_elements;
     broadcast_args.push_back(CreateAccessPtr(workspace, "uint8", IntImm(DataType::Int(32), 0),
                                             workspace_elements, 2));
 
