@@ -677,12 +677,9 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
         auto it = broadcast_buffer_map_.find(op);
         if (it != broadcast_buffer_map_.end()) {
           // Replace with load from broadcast buffer
-          // Use [0, 0] as indices since the vectorized operation will handle
-          // accessing all elements of the broadcast buffer
-          Array<PrimExpr> new_indices;
-          new_indices.push_back(IntImm(DataType::Int(32), 0));
-          new_indices.push_back(IntImm(DataType::Int(32), 0));
-          return BufferLoad(it->second, new_indices);
+          // Use [0] as index since the vectorized operation will handle
+          // accessing all elements of the broadcast buffer as contiguous memory
+          return BufferLoad(it->second, {IntImm(DataType::Int(32), 0)});
         }
         return ExprMutator::VisitExpr_(op);
       }
@@ -1431,10 +1428,11 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       PointerType(PrimType(dtype), "shared")
     );
 
-    // Create 2D shape for broadcast
+    // Create 1D shape for broadcast (total elements)
+    // Vectorized operations expect contiguous 1D buffers
+    int64_t total_elements = outer_extent * inner_vec_len;
     Array<PrimExpr> shape;
-    shape.push_back(IntImm(DataType::Int(32), outer_extent));
-    shape.push_back(IntImm(DataType::Int(32), inner_vec_len));
+    shape.push_back(IntImm(DataType::Int(32), total_elements));
 
     Buffer buf = Buffer(
       data,
@@ -1462,10 +1460,10 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       PointerType(PrimType(dtype), "shared")
     );
 
-    // Create 2D shape for workspace
+    // Create 1D shape for workspace (total elements)
+    int64_t total_elements = outer_extent * inner_vec_len;
     Array<PrimExpr> shape;
-    shape.push_back(IntImm(DataType::Int(32), outer_extent));
-    shape.push_back(IntImm(DataType::Int(32), inner_vec_len));
+    shape.push_back(IntImm(DataType::Int(32), total_elements));
 
     Buffer buf = Buffer(
       data,
@@ -1483,14 +1481,15 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     return buf;
   }
 
-  // Generate broadcast statement to broadcast a 1D buffer to a 2D buffer
+  // Generate broadcast statement to broadcast a 1D buffer to a 1D buffer (broadcasted data stored contiguously)
   Stmt GenerateBroadcastStmt(const Buffer& src_1d,
-                             const Buffer& dst_2d,
+                             const Buffer& dst_1d,
                              const Buffer& workspace,
                              int64_t broadcast_dim,
                              int64_t outer_extent,
                              int64_t inner_vec_len) {
     // Build the tl.ascend_broadcast call
+    // The broadcast operation uses explicit shape arguments, so the buffer shape doesn't matter
     // Format: tir.call_intrin("handle", tl.ascend_broadcast(), "Broadcast<{dtype}, 2, {axis}, false>",
     //                         dst.access_ptr("w"), src.access_ptr("r"), tmp.access_ptr("r"),
     //                         dim, dst_shape[0], dst_shape[1], ..., src_shape[0], ...)
@@ -1501,9 +1500,9 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     std::string template_args = dtype_str + ", 2, " + std::to_string(broadcast_dim) + ", false";
     broadcast_args.push_back(StringImm("Broadcast<" + template_args + ">"));
 
-    // 1. dst buffer access ptr
+    // 1. dst buffer access ptr (1D buffer, but broadcast op treats it as 2D based on shape args)
     int64_t total_elements = outer_extent * inner_vec_len;
-    broadcast_args.push_back(CreateAccessPtr(dst_2d, dtype_str, IntImm(DataType::Int(32), 0),
+    broadcast_args.push_back(CreateAccessPtr(dst_1d, dtype_str, IntImm(DataType::Int(32), 0),
                                             total_elements, 2));
 
     // 2. src buffer access ptr
@@ -1518,11 +1517,11 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     // 4. dim (number of dimensions)
     broadcast_args.push_back(IntImm(DataType::Int(32), 2));
 
-    // 5. dst shape array
+    // 5. dst shape array (explicit 2D shape for broadcast operation)
     broadcast_args.push_back(IntImm(DataType::Int(32), outer_extent));
     broadcast_args.push_back(IntImm(DataType::Int(32), inner_vec_len));
 
-    // 6. src shape array
+    // 6. src shape array (explicit 1D shape for broadcast operation)
     broadcast_args.push_back(IntImm(DataType::Int(32), src_elements));
 
     PrimExpr broadcast_call = Call(DataType::Handle(), tl::ascend_broadcast(), broadcast_args);
