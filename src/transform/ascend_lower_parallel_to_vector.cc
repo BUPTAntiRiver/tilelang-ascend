@@ -641,16 +641,24 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     Array<Stmt> broadcast_stmts;
     std::unordered_map<const BufferLoadNode*, Buffer> broadcast_buffer_map;
     std::unordered_map<const BufferLoadNode*, Buffer> workspace_buffer_map;
+    std::unordered_map<const BufferLoadNode*, int64_t> broadcast_dim_map;
 
-    for (auto& info : collector.broadcast_infos) {
-      info.broadcast_buffer = CreateBroadcastBuffer(info.load->buffer, info.outer_extent, info.inner_vec_len);
-      info.workspace_buffer = CreateBroadcastWorkspaceBuffer(info.outer_extent, info.inner_vec_len);
-      broadcast_buffer_map[info.load] = info.broadcast_buffer;
-      workspace_buffer_map[info.load] = info.workspace_buffer;
+    for (size_t i = 0; i < collector.broadcast_infos.size(); ++i) {
+      collector.broadcast_infos[i].broadcast_buffer = CreateBroadcastBuffer(
+          collector.broadcast_infos[i].load->buffer,
+          collector.broadcast_infos[i].outer_extent,
+          collector.broadcast_infos[i].inner_vec_len);
+      collector.broadcast_infos[i].workspace_buffer = CreateBroadcastWorkspaceBuffer(
+          collector.broadcast_infos[i].outer_extent,
+          collector.broadcast_infos[i].inner_vec_len);
+      broadcast_buffer_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].broadcast_buffer;
+      workspace_buffer_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].workspace_buffer;
+      broadcast_dim_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].broadcast_dim;
     }
 
     // Step 3: Generate broadcast calls
-    for (const auto& info : collector.broadcast_infos) {
+    for (size_t i = 0; i < collector.broadcast_infos.size(); ++i) {
+      const auto& info = collector.broadcast_infos[i];
       Buffer broadcast_buffer = broadcast_buffer_map[info.load];
       Buffer workspace_buffer = workspace_buffer_map[info.load];
       Stmt broadcast_stmt = GenerateBroadcastStmt(info.load->buffer, broadcast_buffer,
@@ -663,9 +671,15 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     class BufferLoadReplacer : public ExprMutator {
     public:
       const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map_;
+      const std::unordered_map<const BufferLoadNode*, int64_t>& broadcast_dim_map_;
+      AscendLowerParallelToVector* parent_;
 
-      BufferLoadReplacer(const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map)
-          : broadcast_buffer_map_(broadcast_buffer_map) {}
+      BufferLoadReplacer(const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map,
+                         const std::unordered_map<const BufferLoadNode*, int64_t>& broadcast_dim_map,
+                         AscendLowerParallelToVector* parent)
+          : broadcast_buffer_map_(broadcast_buffer_map),
+            broadcast_dim_map_(broadcast_dim_map),
+            parent_(parent) {}
 
       PrimExpr VisitExpr_(const BufferLoadNode* op) override {
         auto it = broadcast_buffer_map_.find(op);
@@ -673,15 +687,40 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
           // Replace with load from broadcast buffer
           // Create indices for 2D broadcast buffer
           Array<PrimExpr> new_indices;
-          new_indices.push_back(IntImm(DataType::Int(32), 0));  // outer dim
-          new_indices.push_back(IntImm(DataType::Int(32), 0));  // inner dim
+          int64_t broadcast_dim = broadcast_dim_map_.at(op);
+
+          if (broadcast_dim == 1) {
+            // Broadcast along outer dimension: need [outer_var, vector_var]
+            if (parent_->outer_dim_var_ != nullptr) {
+              new_indices.push_back(GetRef<PrimExpr>(parent_->outer_dim_var_));
+            } else {
+              new_indices.push_back(IntImm(DataType::Int(32), 0));
+            }
+            if (parent_->vector_dim_var_ != nullptr) {
+              new_indices.push_back(GetRef<PrimExpr>(parent_->vector_dim_var_));
+            } else {
+              new_indices.push_back(IntImm(DataType::Int(32), 0));
+            }
+          } else {
+            // Broadcast along inner dimension: need [vector_var, outer_var]
+            if (parent_->vector_dim_var_ != nullptr) {
+              new_indices.push_back(GetRef<PrimExpr>(parent_->vector_dim_var_));
+            } else {
+              new_indices.push_back(IntImm(DataType::Int(32), 0));
+            }
+            if (parent_->outer_dim_var_ != nullptr) {
+              new_indices.push_back(GetRef<PrimExpr>(parent_->outer_dim_var_));
+            } else {
+              new_indices.push_back(IntImm(DataType::Int(32), 0));
+            }
+          }
           return BufferLoad(it->second, new_indices);
         }
         return ExprMutator::VisitExpr_(op);
       }
     };
 
-    BufferLoadReplacer replacer(broadcast_buffer_map);
+    BufferLoadReplacer replacer(broadcast_buffer_map, broadcast_dim_map, this);
     PrimExpr new_value = replacer(store->value);
 
     // Step 5: Do the normal pass with the modified expression
