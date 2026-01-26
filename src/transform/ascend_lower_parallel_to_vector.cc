@@ -641,7 +641,6 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     Array<Stmt> broadcast_stmts;
     std::unordered_map<const BufferLoadNode*, Buffer> broadcast_buffer_map;
     std::unordered_map<const BufferLoadNode*, Buffer> workspace_buffer_map;
-    std::unordered_map<const BufferLoadNode*, int64_t> broadcast_dim_map;
 
     for (size_t i = 0; i < collector.broadcast_infos.size(); ++i) {
       collector.broadcast_infos[i].broadcast_buffer = CreateBroadcastBuffer(
@@ -653,7 +652,6 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
           collector.broadcast_infos[i].inner_vec_len);
       broadcast_buffer_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].broadcast_buffer;
       workspace_buffer_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].workspace_buffer;
-      broadcast_dim_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].broadcast_dim;
     }
 
     // Step 3: Generate broadcast calls
@@ -671,56 +669,26 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     class BufferLoadReplacer : public ExprMutator {
     public:
       const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map_;
-      const std::unordered_map<const BufferLoadNode*, int64_t>& broadcast_dim_map_;
-      AscendLowerParallelToVector* parent_;
 
-      BufferLoadReplacer(const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map,
-                         const std::unordered_map<const BufferLoadNode*, int64_t>& broadcast_dim_map,
-                         AscendLowerParallelToVector* parent)
-          : broadcast_buffer_map_(broadcast_buffer_map),
-            broadcast_dim_map_(broadcast_dim_map),
-            parent_(parent) {}
+      BufferLoadReplacer(const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map)
+          : broadcast_buffer_map_(broadcast_buffer_map) {}
 
       PrimExpr VisitExpr_(const BufferLoadNode* op) override {
         auto it = broadcast_buffer_map_.find(op);
         if (it != broadcast_buffer_map_.end()) {
           // Replace with load from broadcast buffer
-          // Create indices for 2D broadcast buffer
+          // Use [0, 0] as indices since the vectorized operation will handle
+          // accessing all elements of the broadcast buffer
           Array<PrimExpr> new_indices;
-          int64_t broadcast_dim = broadcast_dim_map_.at(op);
-
-          if (broadcast_dim == 1) {
-            // Broadcast along outer dimension: need [outer_var, vector_var]
-            if (parent_->outer_dim_var_ != nullptr) {
-              new_indices.push_back(GetRef<PrimExpr>(parent_->outer_dim_var_));
-            } else {
-              new_indices.push_back(IntImm(DataType::Int(32), 0));
-            }
-            if (parent_->vector_dim_var_ != nullptr) {
-              new_indices.push_back(GetRef<PrimExpr>(parent_->vector_dim_var_));
-            } else {
-              new_indices.push_back(IntImm(DataType::Int(32), 0));
-            }
-          } else {
-            // Broadcast along inner dimension: need [vector_var, outer_var]
-            if (parent_->vector_dim_var_ != nullptr) {
-              new_indices.push_back(GetRef<PrimExpr>(parent_->vector_dim_var_));
-            } else {
-              new_indices.push_back(IntImm(DataType::Int(32), 0));
-            }
-            if (parent_->outer_dim_var_ != nullptr) {
-              new_indices.push_back(GetRef<PrimExpr>(parent_->outer_dim_var_));
-            } else {
-              new_indices.push_back(IntImm(DataType::Int(32), 0));
-            }
-          }
+          new_indices.push_back(IntImm(DataType::Int(32), 0));
+          new_indices.push_back(IntImm(DataType::Int(32), 0));
           return BufferLoad(it->second, new_indices);
         }
         return ExprMutator::VisitExpr_(op);
       }
     };
 
-    BufferLoadReplacer replacer(broadcast_buffer_map, broadcast_dim_map, this);
+    BufferLoadReplacer replacer(broadcast_buffer_map);
     PrimExpr new_value = replacer(store->value);
 
     // Step 5: Do the normal pass with the modified expression
