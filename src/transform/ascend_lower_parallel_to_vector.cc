@@ -965,7 +965,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     }
 
     if (auto load = operands[1].as<BufferLoadNode>()) {
-      if (IsScalarAccess(load->indices, parallel_vars)) {
+      if (IsScalarAccess(load->indices, parallel_vars, load->buffer)) {
         PrimExpr scalar_offset =
             CalculateBufferOffset(load->indices, load->buffer, parallel_vars);
         auto stmt = GenerateBufferScalarVectorCall(
@@ -1047,7 +1047,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     }
 
     if (auto load = operands[1].as<BufferLoadNode>()) {
-      if (IsScalarAccess(load->indices, parallel_vars)) {
+      if (IsScalarAccess(load->indices, parallel_vars, load->buffer)) {
         PrimExpr scalar_offset =
             CalculateBufferOffset(load->indices, load->buffer, parallel_vars);
         auto stmt = GenerateBufferScalarVectorCall(
@@ -1285,8 +1285,15 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
   }
 
   bool IsScalarAccess(const Array<PrimExpr>& indices,
-                      const std::unordered_set<const VarNode*>& parallel_vars) {
+                      const std::unordered_set<const VarNode*>& parallel_vars,
+                      const Buffer& buffer = Buffer()) {
     if (vector_dim_var_ == nullptr) return true;
+
+    // If the buffer is 2D, treat it as vector access even with constant indices
+    // (e.g., broadcast buffers accessed with [0, 0])
+    if (buffer.defined() && buffer->shape.size() >= 2) {
+      return false;
+    }
 
     // Check if any index contains the vector dimension variable
     for (const auto& idx : indices) {
@@ -1321,7 +1328,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     }
 
     if (auto load = expr.as<BufferLoadNode>()) {
-      return IsScalarAccess(load->indices, parallel_vars);
+      return IsScalarAccess(load->indices, parallel_vars, load->buffer);
     }
 
     return false;
