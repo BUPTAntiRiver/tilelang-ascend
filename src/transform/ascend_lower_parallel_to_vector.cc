@@ -1387,14 +1387,16 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
 
     // Check if the index is a simple variable (no offset or complex expressions)
     if (auto var = index.as<VarNode>()) {
-      // Check if it's the vector dimension variable (broadcast along outer dim)
+      // Check if it's the vector dimension variable (broadcast along outer dim, axis=0)
+      // Source should be [1, inner_vec_len] and broadcast along axis 0
       if (vector_dim_var_ != nullptr && var == vector_dim_var_) {
-        *broadcast_dim = 1;  // Broadcast along outer dimension
+        *broadcast_dim = 0;  // Broadcast along axis 0 (outer dimension)
         return true;
       }
-      // Check if it's the outer dimension variable (broadcast along inner dim)
+      // Check if it's the outer dimension variable (broadcast along inner dim, axis=1)
+      // Source should be [outer_extent, 1] and broadcast along axis 1
       if (outer_dim_var_ != nullptr && var == outer_dim_var_) {
-        *broadcast_dim = 0;  // Broadcast along inner dimension
+        *broadcast_dim = 1;  // Broadcast along axis 1 (inner dimension)
         return true;
       }
     }
@@ -1435,14 +1437,14 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     }
 
     Array<PrimExpr> shape;
-    if (broadcast_dim == 1) {
-      // Broadcasting along outer dimension: view as [src_elements, 1]
-      shape.push_back(IntImm(DataType::Int(32), src_elements));
+    if (broadcast_dim == 0) {
+      // Broadcasting along axis 0 (outer dimension): view as [1, src_elements]
       shape.push_back(IntImm(DataType::Int(32), 1));
+      shape.push_back(IntImm(DataType::Int(32), src_elements));
     } else {
-      // Broadcasting along inner dimension: view as [1, src_elements]
-      shape.push_back(IntImm(DataType::Int(32), 1));
+      // Broadcasting along axis 1 (inner dimension): view as [src_elements, 1]
       shape.push_back(IntImm(DataType::Int(32), src_elements));
+      shape.push_back(IntImm(DataType::Int(32), 1));
     }
 
     Buffer buf = Buffer(
