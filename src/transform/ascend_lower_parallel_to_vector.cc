@@ -558,8 +558,13 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
         }
       }
 
+      // If the buffer uses both dimensions, it's fine
+      // If the buffer uses only one dimension, check if it can be broadcast
       if (!uses_vector_dim || !uses_outer_dim) {
-        return false;
+        int64_t broadcast_dim = 0;
+        if (!CanBroadcast(load, parallel_vars, &broadcast_dim)) {
+          return false;
+        }
       }
     }
 
@@ -594,9 +599,92 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       actual_output_offset = IntImm(DataType::Int(32), 0);  // Start from beginning of temp buffer
     }
 
-        Array<Stmt> row_stmts;
+    // Step 1: Detect all 1D buffers that can be broadcasted
+    class BroadcastableBufferCollector : public ExprVisitor {
+    public:
+      std::vector<BroadcastInfo> broadcast_infos;
+      const std::unordered_set<const VarNode*>& parallel_vars_;
+      int64_t inner_vec_len_;
+      int64_t outer_extent_;
+      AscendLowerParallelToVector* parent_;
+
+      BroadcastableBufferCollector(const std::unordered_set<const VarNode*>& parallel_vars,
+                                   int64_t inner_vec_len, int64_t outer_extent,
+                                   AscendLowerParallelToVector* parent)
+          : parallel_vars_(parallel_vars), inner_vec_len_(inner_vec_len),
+            outer_extent_(outer_extent), parent_(parent) {}
+
+      void VisitExpr_(const BufferLoadNode* op) override {
+        // Only check 1D buffers
+        if (op->buffer->shape.size() == 1) {
+          int64_t broadcast_dim = 0;
+          if (parent_->CanBroadcast(op, parallel_vars_, &broadcast_dim)) {
+            // Check for offset or discrete access
+            if (!parent_->HasOffsetOrDiscreteAccess(op->indices)) {
+              BroadcastInfo info;
+              info.load = op;
+              info.broadcast_dim = broadcast_dim;
+              info.outer_extent = outer_extent_;
+              info.inner_vec_len = inner_vec_len_;
+              broadcast_infos.push_back(info);
+            }
+          }
+        }
+        ExprVisitor::VisitExpr_(op);
+      }
+    };
+
+    BroadcastableBufferCollector collector(parallel_vars, inner_vec_len, outer_extent, this);
+    collector(store->value);
+
+    // Step 2: Create temp buffers for broadcasted 1D buffers
+    Array<Stmt> broadcast_stmts;
+    std::unordered_map<const BufferLoadNode*, Buffer> broadcast_buffer_map;
+
+    for (const auto& info : collector.broadcast_infos) {
+      Buffer broadcast_buffer = CreateBroadcastBuffer(info.load->buffer, info.outer_extent, info.inner_vec_len);
+      broadcast_buffer_map[info.load] = broadcast_buffer;
+    }
+
+    // Step 3: Generate broadcast calls
+    for (const auto& info : collector.broadcast_infos) {
+      Buffer broadcast_buffer = broadcast_buffer_map[info.load];
+      Stmt broadcast_stmt = GenerateBroadcastStmt(info.load->buffer, broadcast_buffer,
+                                                  info.broadcast_dim, info.outer_extent, info.inner_vec_len);
+      broadcast_stmts.push_back(broadcast_stmt);
+    }
+
+    // Step 4: Replace 1D buffers with broadcasted ones in the expression
+    class BufferLoadReplacer : public ExprMutator {
+    public:
+      const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map_;
+
+      BufferLoadReplacer(const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map)
+          : broadcast_buffer_map_(broadcast_buffer_map) {}
+
+      PrimExpr VisitExpr_(const BufferLoadNode* op) override {
+        auto it = broadcast_buffer_map_.find(op);
+        if (it != broadcast_buffer_map_.end()) {
+          // Replace with load from broadcast buffer
+          // Create indices for 2D broadcast buffer
+          Array<PrimExpr> new_indices;
+          new_indices.push_back(IntImm(DataType::Int(32), 0));  // outer dim
+          new_indices.push_back(IntImm(DataType::Int(32), 0));  // inner dim
+          return BufferLoad(it->second, new_indices);
+        }
+        return ExprMutator::VisitExpr_(op);
+      }
+    };
+
+    BufferLoadReplacer replacer(broadcast_buffer_map);
+    PrimExpr new_value = replacer(store->value);
+
+    // Step 5: Do the normal pass with the modified expression
+    Array<Stmt> row_stmts;
+    row_stmts.insert(row_stmts.end(), broadcast_stmts.begin(), broadcast_stmts.end());
+
     int64_t total_elements = is_2d ? (inner_vec_len * outer_extent) : inner_vec_len;
-    bool success = DecomposeExpression(store->value, actual_output_buffer,
+    bool success = DecomposeExpression(new_value, actual_output_buffer,
                                         actual_output_offset, total_elements,
                                         parallel_vars, &row_stmts, is_2d, inner_vec_len);
 
@@ -1250,6 +1338,161 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     }
     return "";
   }
+
+  std::string DTypeToAscendCString(DataType dtype) {
+    if (dtype.is_float()) {
+      if (dtype.bits() == 16) return "half";
+      if (dtype.bits() == 32) return "float";
+      if (dtype.bits() == 64) return "float64";
+    } else if (dtype.is_int()) {
+      if (dtype.bits() == 4) return "AscendC::int4b_t";
+      if (dtype.bits() == 8) return "int8_t";
+      if (dtype.bits() == 16) return "int16_t";
+      if (dtype.bits() == 32) return "int";
+      if (dtype.bits() == 64) return "int64_t";
+    } else if (dtype.is_uint()) {
+      if (dtype.bits() == 8) return "uint8_t";
+      if (dtype.bits() == 16) return "uint16_t";
+      if (dtype.bits() == 32) return "uint32_t";
+      if (dtype.bits() == 64) return "uint64_t";
+    }
+    return "";
+  }
+
+  // Check if a buffer load can be broadcast from 1D to 2D
+  bool CanBroadcast(const BufferLoadNode* load,
+                    const std::unordered_set<const VarNode*>& parallel_vars,
+                    int64_t* broadcast_dim) {
+    if (load->buffer->shape.size() != 1) {
+      return false;  // Only 1D buffers can be broadcast
+    }
+
+    if (load->indices.size() != 1) {
+      return false;  // Must have exactly 1 index for 1D buffer
+    }
+
+    const PrimExpr& index = load->indices[0];
+
+    // Check if the index is a simple variable (no offset or complex expressions)
+    if (auto var = index.as<VarNode>()) {
+      // Check if it's the vector dimension variable (broadcast along outer dim)
+      if (vector_dim_var_ != nullptr && var == vector_dim_var_) {
+        *broadcast_dim = 1;  // Broadcast along outer dimension
+        return true;
+      }
+      // Check if it's the outer dimension variable (broadcast along inner dim)
+      if (outer_dim_var_ != nullptr && var == outer_dim_var_) {
+        *broadcast_dim = 0;  // Broadcast along inner dimension
+        return true;
+      }
+    }
+
+    // If the index is not a simple variable, it might have offset or be discrete access
+    // In that case, we should not use broadcasting and fall back to looping
+    return false;
+  }
+
+  // Check if buffer access has offset or is discrete (not contiguous)
+  bool HasOffsetOrDiscreteAccess(const Array<PrimExpr>& indices) {
+    if (indices.empty()) {
+      return false;
+    }
+
+    // For each index, check if it's a simple variable
+    for (const auto& idx : indices) {
+      if (!idx.as<VarNode>()) {
+        // If it's not a simple variable, it might have offset or be complex
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Create a broadcast buffer with uint8 type for temporary storage
+  Buffer CreateBroadcastBuffer(const Buffer& ref, int64_t outer_extent, int64_t inner_vec_len) {
+    // Use uint8 type for the broadcast buffer
+    DataType dtype = DataType::UInt(8);
+
+    Var data(
+      ref->name + "_broadcast_" + std::to_string(temp_buffer_id_++) + "_data",
+      PointerType(PrimType(dtype), "shared")
+    );
+
+    // Create 2D shape for broadcast
+    Array<PrimExpr> shape;
+    shape.push_back(IntImm(DataType::Int(32), outer_extent));
+    shape.push_back(IntImm(DataType::Int(32), inner_vec_len));
+
+    Buffer buf = Buffer(
+      data,
+      dtype,
+      shape,
+      /*strides=*/{},
+      /*elem_offset=*/PrimExpr(0),
+      /*name=*/data->name_hint,
+      /*data_alignment=*/0,
+      /*offset_factor=*/0,
+      /*buffer_type=*/kDefault
+    );
+
+    temp_buffers_.push_back(buf);
+    return buf;
+  }
+
+  // Generate broadcast statement to broadcast a 1D buffer to a 2D buffer
+  Stmt GenerateBroadcastStmt(const Buffer& src_1d,
+                             const Buffer& dst_2d,
+                             int64_t broadcast_dim,
+                             int64_t outer_extent,
+                             int64_t inner_vec_len) {
+    // Build the tl.ascend_broadcast call
+    // Format: tir.call_intrin("handle", tl.ascend_broadcast(), "Broadcast<{dtype}, 2, {axis}, false>",
+    //                         dst.access_ptr("w"), src.access_ptr("r"), tmp.access_ptr("r"),
+    //                         dim, dst_shape[0], dst_shape[1], ..., src_shape[0], ...)
+    Array<PrimExpr> broadcast_args;
+
+    // 0. Template argument string
+    std::string dtype_str = DTypeToAscendCString(src_1d->dtype);
+    std::string template_args = dtype_str + ", 2, " + std::to_string(broadcast_dim) + ", false";
+    broadcast_args.push_back(StringImm("Broadcast<" + template_args + ">"));
+
+    // 1. dst buffer access ptr
+    int64_t total_elements = outer_extent * inner_vec_len;
+    broadcast_args.push_back(CreateAccessPtr(dst_2d, dtype_str, IntImm(DataType::Int(32), 0),
+                                            total_elements, 2));
+
+    // 2. src buffer access ptr
+    int64_t src_elements = (broadcast_dim == 1) ? inner_vec_len : outer_extent;
+    broadcast_args.push_back(CreateAccessPtr(src_1d, dtype_str, IntImm(DataType::Int(32), 0),
+                                            src_elements, 1));
+
+    // 3. tmp buffer access ptr
+    broadcast_args.push_back(CreateAccessPtr(dst_2d, "uint8", IntImm(DataType::Int(32), 0),
+                                            total_elements, 1));
+
+    // 4. dim (number of dimensions)
+    broadcast_args.push_back(IntImm(DataType::Int(32), 2));
+
+    // 5. dst shape array
+    broadcast_args.push_back(IntImm(DataType::Int(32), outer_extent));
+    broadcast_args.push_back(IntImm(DataType::Int(32), inner_vec_len));
+
+    // 6. src shape array
+    broadcast_args.push_back(IntImm(DataType::Int(32), src_elements));
+
+    PrimExpr broadcast_call = Call(DataType::Handle(), tl::ascend_broadcast(), broadcast_args);
+    return Evaluate(broadcast_call);
+  }
+
+  // Structure to hold broadcast information
+  struct BroadcastInfo {
+    const BufferLoadNode* load;
+    Buffer broadcast_buffer;
+    int64_t broadcast_dim;
+    int64_t outer_extent;
+    int64_t inner_vec_len;
+  };
 
   bool IsScalar(const PrimExpr& expr) {
     return expr.as<IntImmNode>() || expr.as<FloatImmNode>() ||
