@@ -1505,8 +1505,13 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     broadcast_args.push_back(CreateAccessPtr(dst_1d, dtype_str, IntImm(DataType::Int(32), 0),
                                             total_elements, 2));
 
-    // 2. src buffer access ptr
-    int64_t src_elements = (broadcast_dim == 1) ? inner_vec_len : outer_extent;
+    // 2. src buffer access ptr - use the actual size of the source buffer
+    int64_t src_elements = 0;
+    if (auto imm = src_1d->shape[0].as<IntImmNode>()) {
+      src_elements = imm->value;
+    } else {
+      LOG(FATAL) << "Source buffer shape must be constant for broadcast";
+    }
     broadcast_args.push_back(CreateAccessPtr(src_1d, dtype_str, IntImm(DataType::Int(32), 0),
                                             src_elements, 1));
 
