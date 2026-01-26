@@ -649,7 +649,8 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
           collector.broadcast_infos[i].inner_vec_len);
       collector.broadcast_infos[i].workspace_buffer = CreateBroadcastWorkspaceBuffer(
           collector.broadcast_infos[i].outer_extent,
-          collector.broadcast_infos[i].inner_vec_len);
+          collector.broadcast_infos[i].inner_vec_len,
+          collector.broadcast_infos[i].load->buffer->dtype);
       broadcast_buffer_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].broadcast_buffer;
       workspace_buffer_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].workspace_buffer;
     }
@@ -1501,7 +1502,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
   }
 
   // Create a broadcast workspace buffer with uint8 type for temporary storage
-  Buffer CreateBroadcastWorkspaceBuffer(int64_t outer_extent, int64_t inner_vec_len) {
+  Buffer CreateBroadcastWorkspaceBuffer(int64_t outer_extent, int64_t inner_vec_len, DataType dst_dtype) {
     // Use uint8 type for the workspace buffer
     DataType dtype = DataType::UInt(8);
 
@@ -1510,10 +1511,17 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       PointerType(PrimType(dtype), "shared")
     );
 
+    // Calculate workspace size based on dst dtype byte size
+    // Workspace needs to be large enough to hold the same amount of data as dst
+    // Since workspace is uint8 (1 byte), multiply by dst byte size
+    int64_t dst_byte_size = (dst_dtype.bits() + 7) / 8;
+    int64_t workspace_outer = outer_extent * dst_byte_size;
+    int64_t workspace_inner = inner_vec_len;
+
     // Create 2D shape for workspace (broadcast operation requires same rank)
     Array<PrimExpr> shape;
-    shape.push_back(IntImm(DataType::Int(32), outer_extent));
-    shape.push_back(IntImm(DataType::Int(32), inner_vec_len));
+    shape.push_back(IntImm(DataType::Int(32), workspace_outer));
+    shape.push_back(IntImm(DataType::Int(32), workspace_inner));
 
     Buffer buf = Buffer(
       data,
@@ -1568,8 +1576,11 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
                                             src_elements, 2));
 
     // 3. tmp buffer access ptr (workspace buffer, 2D shape)
+    // Workspace size should account for byte size difference (uint8 vs dst dtype)
+    int64_t dst_byte_size = (src_1d->dtype.bits() + 7) / 8;
+    int64_t workspace_elements = total_elements * dst_byte_size;
     broadcast_args.push_back(CreateAccessPtr(workspace, "uint8", IntImm(DataType::Int(32), 0),
-                                            total_elements, 2));
+                                            workspace_elements, 2));
 
     // 4. dim (number of dimensions)
     broadcast_args.push_back(IntImm(DataType::Int(32), 2));
