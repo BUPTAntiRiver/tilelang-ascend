@@ -821,6 +821,37 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       }
     }
 
+    // Check if any expression has discrete access
+    bool has_discrete_access = false;
+    if (!plan.is_2d_vectorizable) {
+      class DiscreteAccessChecker : public StmtExprVisitor {
+      public:
+        bool has_discrete_access_{false};
+
+        void VisitExpr_(const BufferLoadNode* op) override {
+          // Check if any index is not a simple variable or IntImm
+          for (const auto& idx : op->indices) {
+            if (!idx.as<VarNode>() && !idx.as<IntImmNode>()) {
+              has_discrete_access_ = true;
+              return;
+            }
+          }
+          StmtExprVisitor::VisitExpr_(op);
+        }
+      };
+
+      for (const Stmt& s : stores_to_process) {
+        if (auto st = s.as<BufferStoreNode>()) {
+          DiscreteAccessChecker checker;
+          checker(st->value);
+          if (checker.has_discrete_access_) {
+            has_discrete_access = true;
+            break;
+          }
+        }
+      }
+    }
+
     Array<Stmt> bodies;
     for (const Stmt& s : stores_to_process) {
       if (auto st = s.as<BufferStoreNode>()) {
@@ -849,7 +880,12 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
 
     Stmt combined = (bodies.size() == 1) ? bodies[0] : SeqStmt::Flatten(bodies);
 
-    if (plan.is_2d_vectorizable || has_outer_serial || plan.outer_extent == 1) {
+    // Skip outer loop creation if:
+    // - 2D vectorization is enabled, OR
+    // - There's an outer serial loop, OR
+    // - Outer extent is 1, OR
+    // - Discrete access is detected (to avoid breaking indexing)
+    if (plan.is_2d_vectorizable || has_outer_serial || plan.outer_extent == 1 || has_discrete_access) {
       return combined;
   }
 
