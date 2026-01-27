@@ -640,7 +640,29 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       actual_output_offset = IntImm(DataType::Int(32), 0);  // Start from beginning of temp buffer
     }
 
-    // Step 1: Detect all 1D buffers that can be broadcasted
+    // Step 1: Check if the expression has discrete access patterns
+    // If so, skip broadcast collection entirely
+    class DiscreteAccessChecker : public StmtExprVisitor {
+    public:
+      bool has_discrete_access_{false};
+
+      void VisitExpr_(const BufferLoadNode* op) override {
+        // Check if any index is not a simple variable or IntImm
+        for (const auto& idx : op->indices) {
+          if (!idx.as<VarNode>() && !idx.as<IntImmNode>()) {
+            has_discrete_access_ = true;
+            return;
+          }
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+    };
+
+    DiscreteAccessChecker discrete_checker;
+    discrete_checker(store->value);
+
+    // Step 2: Detect all 1D buffers that can be broadcasted
+    // Only collect broadcast buffers if there's no discrete access
     class BroadcastableBufferCollector : public ExprVisitor {
     public:
       std::vector<BroadcastInfo> broadcast_infos;
@@ -676,9 +698,12 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     };
 
     BroadcastableBufferCollector collector(parallel_vars, inner_vec_len, outer_extent, this);
-    collector(store->value);
+    // Only collect broadcast buffers if there's no discrete access in the expression
+    if (!discrete_checker.has_discrete_access_) {
+      collector(store->value);
+    }
 
-    // Step 2: Create temp buffers for broadcasted 1D buffers and workspace buffers
+    // Step 3: Create temp buffers for broadcasted 1D buffers and workspace buffers
     Array<Stmt> broadcast_stmts;
     std::unordered_map<const BufferLoadNode*, Buffer> broadcast_buffer_map;
     std::unordered_map<const BufferLoadNode*, Buffer> workspace_buffer_map;
@@ -696,7 +721,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       workspace_buffer_map[collector.broadcast_infos[i].load] = collector.broadcast_infos[i].workspace_buffer;
     }
 
-    // Step 3: Generate broadcast calls
+    // Step 4: Generate broadcast calls
     for (size_t i = 0; i < collector.broadcast_infos.size(); ++i) {
       const auto& info = collector.broadcast_infos[i];
       Buffer broadcast_buffer = broadcast_buffer_map[info.load];
@@ -707,7 +732,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       broadcast_stmts.push_back(broadcast_stmt);
     }
 
-    // Step 4: Replace 1D buffers with broadcasted ones in the expression
+    // Step 5: Replace 1D buffers with broadcasted ones in the expression
     class BufferLoadReplacer : public ExprMutator {
     public:
       const std::unordered_map<const BufferLoadNode*, Buffer>& broadcast_buffer_map_;
@@ -730,7 +755,7 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     BufferLoadReplacer replacer(broadcast_buffer_map);
     PrimExpr new_value = replacer(store->value);
 
-    // Step 5: Do the normal pass with the modified expression
+    // Step 6: Do the normal pass with the modified expression
     Array<Stmt> row_stmts;
     row_stmts.insert(row_stmts.end(), broadcast_stmts.begin(), broadcast_stmts.end());
 
