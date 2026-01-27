@@ -524,6 +524,19 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     return false;
   }
 
+  // Check if a buffer load uses discrete access patterns
+  // Discrete access means indices are BufferLoad or other complex expressions,
+  // not simple variables like i, j, etc.
+  bool HasDiscreteAccess(const BufferLoadNode* load) {
+    for (const auto& idx : load->indices) {
+      // Check if the index is NOT a simple variable or IntImm
+      if (!idx.as<VarNode>() && !idx.as<IntImmNode>()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool CheckExpressionSupports2DVectorization(
     const PrimExpr& expr,
     const std::unordered_set<const VarNode*>& parallel_vars
@@ -567,6 +580,12 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     collector(expr);
 
     for (const auto* load : collector.loads) {
+      // Check for discrete access patterns (e.g., a[idx[i], j])
+      // Discrete access cannot be vectorized with 2D vectorization
+      if (HasDiscreteAccess(load)) {
+        return false;
+      }
+
       bool uses_vector_dim = false;
       bool uses_outer_dim = false;
       for (const auto& idx : load->indices) {
