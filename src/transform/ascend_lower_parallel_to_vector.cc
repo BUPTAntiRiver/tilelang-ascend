@@ -891,10 +891,10 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     // For discrete access cases, create a serial loop but do NOT replace the variable
     // This preserves the original indexing (e.g., b[i]) while providing the loop structure
     if (has_discrete_access) {
-      // Create a serial loop using the original outer variable
-      if (plan.outer_index_var != nullptr) {
+      // Create a serial loop using the actual outer dimension variable
+      if (outer_dim_var_ != nullptr) {
         return For(
-          Var(plan.outer_index_var->name_hint, plan.outer_index_var->dtype),
+          GetRef<Var>(outer_dim_var_),
           IntImm(DataType::Int(32), 0),
           IntImm(DataType::Int(32), plan.outer_extent),
           ForKind::kSerial,
