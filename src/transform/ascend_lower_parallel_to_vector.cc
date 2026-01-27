@@ -883,12 +883,28 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
     // Skip outer loop creation if:
     // - 2D vectorization is enabled, OR
     // - There's an outer serial loop, OR
-    // - Outer extent is 1, OR
-    // - Discrete access is detected (to avoid breaking indexing)
-    if (plan.is_2d_vectorizable || has_outer_serial || plan.outer_extent == 1 || has_discrete_access) {
+    // - Outer extent is 1
+    if (plan.is_2d_vectorizable || has_outer_serial || plan.outer_extent == 1) {
       return combined;
   }
 
+    // For discrete access cases, create a serial loop but do NOT replace the variable
+    // This preserves the original indexing (e.g., b[i]) while providing the loop structure
+    if (has_discrete_access) {
+      // Create a serial loop using the original outer variable
+      if (plan.outer_index_var != nullptr) {
+        return For(
+          Var(plan.outer_index_var->name_hint, plan.outer_index_var->dtype),
+          IntImm(DataType::Int(32), 0),
+          IntImm(DataType::Int(32), plan.outer_extent),
+          ForKind::kSerial,
+          combined
+        );
+      }
+      return combined;
+    }
+
+    // Normal case: replace outer variable with outer_broadcast_idx for broadcasting
     Var outer_var("outer_broadcast_idx", DataType::Int(32));
     if (plan.outer_index_var != nullptr) {
       ReplaceVarExpr replacer(plan.outer_index_var, outer_var);
