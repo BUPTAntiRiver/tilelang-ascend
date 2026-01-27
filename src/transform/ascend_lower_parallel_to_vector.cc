@@ -1411,6 +1411,19 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       return false;
     }
 
+    // Special case: 1D buffer accessed with only outer dimension variable in 2D context
+    // This should be treated as scalar (broadcasted across inner dimension)
+    if (buffer.defined() && buffer->shape.size() == 1 &&
+        outer_dim_var_ != nullptr && indices.size() == 1) {
+      // Check if the index is the outer dimension variable
+      if (auto var = indices[0].as<VarNode>()) {
+        if (var == outer_dim_var_) {
+          // This is a row vector like b[i] in a 2D context, treat as scalar
+          return true;
+        }
+      }
+    }
+
     // If the buffer is 1D and has multiple elements, treat it as vector access
     // (e.g., broadcast buffers accessed with [0])
     if (buffer.defined() && buffer->shape.size() == 1) {
