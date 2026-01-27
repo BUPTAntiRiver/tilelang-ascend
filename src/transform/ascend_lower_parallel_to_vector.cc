@@ -541,6 +541,28 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       }
     };
 
+    // Helper to check if an expression contains a specific variable
+    auto ContainsVar = [](const PrimExpr& expr, const VarNode* var) -> bool {
+      class VarChecker : public ExprVisitor {
+      public:
+        const VarNode* target_var_;
+        bool found_{false};
+
+        explicit VarChecker(const VarNode* target_var) : target_var_(target_var) {}
+
+        void VisitExpr_(const VarNode* op) override {
+          if (op == target_var_) {
+            found_ = true;
+          }
+          ExprVisitor::VisitExpr_(op);
+        }
+      };
+
+      VarChecker checker(var);
+      checker(expr);
+      return checker.found_;
+    };
+
     BufferLoadCollector collector;
     collector(expr);
 
@@ -548,13 +570,13 @@ class AscendLowerParallelToVector : public arith::IRMutatorWithAnalyzer {
       bool uses_vector_dim = false;
       bool uses_outer_dim = false;
       for (const auto& idx : load->indices) {
-        if (auto var = idx.as<VarNode>()) {
-          if (var == vector_dim_var_) {
-            uses_vector_dim = true;
-          }
-          if (var == outer_dim_var_) {
-            uses_outer_dim = true;
-          }
+        // Use ContainsVar to properly detect variable usage in expressions
+        // This handles discrete access patterns like a[idx[i], j]
+        if (ContainsVar(idx, vector_dim_var_)) {
+          uses_vector_dim = true;
+        }
+        if (ContainsVar(idx, outer_dim_var_)) {
+          uses_outer_dim = true;
         }
       }
 
