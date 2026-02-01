@@ -156,11 +156,29 @@ private:
 
   void SigmoidCodegen (const CallNode *op, const std::string& op_name);
 
+  void ClampMaxMinCodegen (const CallNode *op);
+
   void ClampCodegen (const CallNode *op);
 
   void RoundCodegen (const CallNode *op, const std::string& op_name);
 
   void ReinterpretCastCodegen (const CallNode *op);
+
+  void CreateSubExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void CreateAbsExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void CreateMinsExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void CreateReduceSumExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void GatherMaskExperimentCodegen(const CallNode *op);
+
+  void FillExperimentCodegen(const CallNode *op);
+
+  void SumExperimentCodegen(const CallNode *op);
+
+  void CreateDatacacheExperimentCodegen(const CallNode *op);
 
 private:
   // Whether scope such as "__shared__" or "__constant__"  is part of type.
